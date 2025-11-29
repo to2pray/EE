@@ -11,11 +11,10 @@ Trials: 5
 import os
 import csv
 import time
-from datetime import datetime
+from datetime import datetime, timezone  # Fixed import
 from tqdm import tqdm
 from statistics import mean, stdev
 
-from datagen import generate_dataset_suite
 from memconstraint import MemoryMonitor
 from mysorts import quicksort_wrapper, mergesort_wrapper
 from datagen import (
@@ -24,6 +23,7 @@ from datagen import (
     generate_reverse_sorted,
     generate_duplicate_heavy
 )
+
 # -----------------------------
 # CONFIGURATION
 # -----------------------------
@@ -36,9 +36,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(BASE_DIR, "../results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
+# Fixed datetime deprecation
 RAW_CSV = os.path.join(
     RESULTS_DIR,
-    f"raw_results_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv"
+    f"raw_results_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.csv"
 )
 
 
@@ -52,13 +53,15 @@ def write_raw_header():
             "size",
             "structure",
             "trial",
+            "memory_limit_MB",
             "QuickSort_time_s",
             "QuickSort_memory_MB",
+            "QuickSort_comparisons",
+            "QuickSort_success",
             "MergeSort_time_s",
             "MergeSort_memory_MB",
-            "QuickSort_comparisons",
             "MergeSort_comparisons",
-            "memory_limit_MB"
+            "MergeSort_success",
         ])
 
 
@@ -81,6 +84,7 @@ def write_summary_table(memory_limit, data_rows):
         w.writerow([
             "size",
             "structure",
+            "trials_succeeded",
             "QuickSort_mean_time",
             "QuickSort_std_time",
             "QuickSort_mean_memory",
@@ -98,6 +102,7 @@ def write_summary_table(memory_limit, data_rows):
             w.writerow([
                 row["size"],
                 row["structure"],
+                row["n_trials"],
                 row["qs_mean_t"],
                 row["qs_std_t"],
                 row["qs_mean_m"],
@@ -111,7 +116,7 @@ def write_summary_table(memory_limit, data_rows):
                 row["ms_mean_c"],
                 row["ms_std_c"],
             ])
-    print(f"Wrote table for mem {memory_limit} MB -> {outpath}")
+    print(f"\nWrote table for mem {memory_limit} MB -> {outpath}")
 
 
 # --------------------------------
@@ -119,89 +124,142 @@ def write_summary_table(memory_limit, data_rows):
 # --------------------------------
 
 def run_experiments():
-
     print(f"Writing raw results to {RAW_CSV}")
     write_raw_header()
 
     total_runs = len(SIZES) * len(STRUCTURES) * TRIALS * len(MEMORY_LIMITS)
 
-    pbar = tqdm(total=total_runs, desc="Total runs")
+    pbar = tqdm(total=total_runs, desc="Total runs", unit="run")
 
     # Loop memory limits separately (so we can compute per-limit table)
     for mem_limit in MEMORY_LIMITS:
-        print(f"\n=== Running experiments for memory limit = {mem_limit} MB ===")
+        print(f"\n{'='*70}")
+        print(f"Running experiments for memory limit = {mem_limit} MB")
+        print(f"{'='*70}")
 
-        summary_rows = []  # (will contain aggregated stats for Table 1)
-
-        # Collect all rows FIRST to aggregate later
+        summary_rows = []
         aggregated = {}  # key = (size, structure), value = list of trial dicts
 
         for size in SIZES:
+            print(f"\nDataset size: {size:,} elements")
 
             for structure in STRUCTURES:
+                print(f"  {structure:20s}: ", end="", flush=True)
 
                 for trial in range(1, TRIALS + 1):
-                    # Generate only the required dataset (not all 4 at once)
-                    if structure == "random":
-                        dataset = generate_random(size)
-                    elif structure == "nearly_sorted":
-                        dataset = generate_nearly_sorted(size)
-                    elif structure == "reverse":
-                        dataset = generate_reverse_sorted(size)
-                    elif structure == "duplicate_heavy":
-                        dataset = generate_duplicate_heavy(size)
-                    else:
-                        raise ValueError(f"Unknown dataset structure: {structure}")
+                    
+                    # ==========================================
+                    # CRITICAL FIX: Generate dataset OUTSIDE memory constraint
+                    # ==========================================
+                    try:
+                        if structure == "random":
+                            dataset = generate_random(size)
+                        elif structure == "nearly_sorted":
+                            dataset = generate_nearly_sorted(size)
+                        elif structure == "reverse":
+                            dataset = generate_reverse_sorted(size)
+                        elif structure == "duplicate_heavy":
+                            dataset = generate_duplicate_heavy(size)
+                        else:
+                            raise ValueError(f"Unknown structure: {structure}")
+                    except MemoryError as e:
+                        print(f"\n  ERROR: Cannot generate {size} dataset (insufficient memory)")
+                        # Skip this configuration entirely
+                        pbar.update(1)
+                        continue
+                    
                     # --------------------
                     # QUICK SORT
                     # --------------------
-                    with MemoryMonitor(limit_mb=mem_limit) as monitor_qs:
-                        start = time.perf_counter()
-                        _, qs_comparisons = quicksort_wrapper(dataset)
-                        qs_time = time.perf_counter() - start
-                        qs_memory = monitor_qs.get_peak_usage()
+                    qs_success = False
+                    try:
+                        with MemoryMonitor(limit_mb=mem_limit) as monitor_qs:
+                            start = time.perf_counter()
+                            _, qs_comparisons = quicksort_wrapper(dataset)
+                            qs_time = time.perf_counter() - start
+                            qs_memory = monitor_qs.get_peak_usage()
+                        
+                        if not monitor_qs.memory_exceeded:
+                            qs_success = True
+                        else:
+                            qs_time = None
+                            qs_memory = None
+                            qs_comparisons = None
+                    
+                    except Exception as e:
+                        print(f"\n  QS ERROR: {e}")
+                        qs_time = None
+                        qs_memory = None
+                        qs_comparisons = None
 
                     # --------------------
                     # MERGE SORT
                     # --------------------
-                    with MemoryMonitor(limit_mb=mem_limit) as monitor_ms:
-                        start = time.perf_counter()
-                        _, ms_comparisons = mergesort_wrapper(dataset)
-                        ms_time = time.perf_counter() - start
-                        ms_memory = monitor_ms.get_peak_usage()
+                    ms_success = False
+                    try:
+                        with MemoryMonitor(limit_mb=mem_limit) as monitor_ms:
+                            start = time.perf_counter()
+                            _, ms_comparisons = mergesort_wrapper(dataset)
+                            ms_time = time.perf_counter() - start
+                            ms_memory = monitor_ms.get_peak_usage()
+                        
+                        if not monitor_ms.memory_exceeded:
+                            ms_success = True
+                        else:
+                            ms_time = None
+                            ms_memory = None
+                            ms_comparisons = None
+                    
+                    except Exception as e:
+                        print(f"\n  MS ERROR: {e}")
+                        ms_time = None
+                        ms_memory = None
+                        ms_comparisons = None
 
                     # Write to raw CSV
                     append_raw_row([
                         size,
                         structure,
                         trial,
-                        qs_time,
-                        qs_memory,
-                        ms_time,
-                        ms_memory,
-                        qs_comparisons,
-                        ms_comparisons,
-                        mem_limit
+                        mem_limit,
+                        qs_time if qs_time is not None else "FAIL",
+                        qs_memory if qs_memory is not None else "FAIL",
+                        qs_comparisons if qs_comparisons is not None else "FAIL",
+                        qs_success,
+                        ms_time if ms_time is not None else "FAIL",
+                        ms_memory if ms_memory is not None else "FAIL",
+                        ms_comparisons if ms_comparisons is not None else "FAIL",
+                        ms_success,
                     ])
 
-                    # Store for summary
-                    key = (size, structure)
-                    aggregated.setdefault(key, [])
-                    aggregated[key].append({
-                        "qs_t": qs_time,
-                        "qs_m": qs_memory,
-                        "qs_c": qs_comparisons,
-                        "ms_t": ms_time,
-                        "ms_m": ms_memory,
-                        "ms_c": ms_comparisons,
-                    })
+                    # Store for summary (only successful trials)
+                    if qs_success and ms_success:
+                        key = (size, structure)
+                        aggregated.setdefault(key, [])
+                        aggregated[key].append({
+                            "qs_t": qs_time,
+                            "qs_m": qs_memory,
+                            "qs_c": qs_comparisons,
+                            "ms_t": ms_time,
+                            "ms_m": ms_memory,
+                            "ms_c": ms_comparisons,
+                        })
+                        print("✓", end="", flush=True)
+                    else:
+                        print("✗", end="", flush=True)
 
                     pbar.update(1)
+                
+                print()  # Newline after structure
 
         # -------------------------
         # BUILD SUMMARY TABLE
         # -------------------------
-        for (size, structure), entry_list in aggregated.items():
+        print(f"\nComputing summary statistics...")
+        for (size, structure), entry_list in sorted(aggregated.items()):
+            if not entry_list:
+                continue
+
             qs_times = [e["qs_t"] for e in entry_list]
             qs_mems = [e["qs_m"] for e in entry_list]
             qs_comps = [e["qs_c"] for e in entry_list]
@@ -213,6 +271,7 @@ def run_experiments():
             summary_rows.append({
                 "size": size,
                 "structure": structure,
+                "n_trials": len(entry_list),
 
                 "qs_mean_t": mean(qs_times),
                 "qs_std_t": stdev(qs_times) if len(qs_times) > 1 else 0,
@@ -236,11 +295,24 @@ def run_experiments():
         write_summary_table(mem_limit, summary_rows)
 
     pbar.close()
-    print("Done")
+    print("\n" + "="*70)
+    print("EXPERIMENTS COMPLETE")
+    print("="*70)
+    print(f"Raw data: {RAW_CSV}")
+    print(f"Summary tables: {RESULTS_DIR}/table1_mem*.csv")
+    print("="*70)
 
 
 # --------------------------------
 # ENTRY POINT
 # --------------------------------
 if __name__ == "__main__":
-    run_experiments()
+    try:
+        run_experiments()
+    except KeyboardInterrupt:
+        print("\n\nExperiment interrupted by user (Ctrl+C)")
+        print("Partial results saved to CSV files")
+    except Exception as e:
+        print(f"\n\nFATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
